@@ -21,6 +21,10 @@ The script functions as a low-level system monitor by bridging PowerShell with n
 
 ## 3. Evasion Characteristics
 This type of script often evades basic endpoint protection for several reasons:
-1.  **Dual-Use APIs:** The APIs used (`SetWindowsHookEx`) are entirely legitimate and frequently used by standard software, such as macro recorders, accessibility tools, and screen readers.
-2.  **No Network Exfiltration:** The script writes data to a local text file (`keyboard_log.txt`) rather than opening a network connection to a Command and Control (C2) server. This avoids triggering firewall alerts or network behavior monitors.
-3.  **Fileless Nature:** Because the core logic is plain text compiled in memory, there is no static hash for traditional AV engines to block permanently without risking false positives against legitimate admin scripts.
+1. **Dual-Use APIs:** The APIs used (`SetWindowsHookEx`) are entirely legitimate and frequently used by standard software, such as macro recorders, accessibility tools, and screen readers.
+2. **No Network Exfiltration:** The script writes data to a local text file (`keyboard_log.txt`) rather than opening a network connection to a Command and Control (C2) server. This avoids triggering firewall alerts or network behavior monitors.
+3. **Fileless Nature:** Because the core logic is plain text compiled in memory, there is no static hash for traditional AV engines to block permanently without risking false positives against legitimate admin scripts.
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File "C:\path\to\Test-KeyboardHardware.ps1"
+```
